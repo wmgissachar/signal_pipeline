@@ -7,6 +7,9 @@ from google.cloud.exceptions import NotFound
 from pandas_gbq import to_gbq
 from datetime import timedelta
 
+from scipy.optimize import curve_fit
+import warnings
+
 # Need imports
 from Database import Database
 from GetSignal import GetSignal
@@ -1095,6 +1098,273 @@ def get_unique_signals_from_gbq(project_id='issachar-feature-library',
     # Return the unique signals as a list.
     return df['signal'].unique().tolist()
 
+
+
+
+class OscillationCalculator:
+    """
+    Given a DataFrame with columns [signal_col], plus possibly some returns columns,
+    run a single pass of FFT + sine-wave fit to find amplitude, frequency, phase, offset, etc.
+    """
+
+    def __init__(self, df, signal_col):
+        """
+        df: DataFrame with index = date or [date, requestId]
+            containing columns => [signal_col].
+            For best results, ensure it's sorted by date or by index.
+        signal_col: string for the column name we want to analyze
+        """
+        self.df = df
+        self.signal_col = signal_col
+
+    def _sine_wave(self, t, A, f, phi, C):
+        # The model: A * sin(2 pi f t + phi) + C
+        return A * np.sin(2 * np.pi * f * t + phi) + C
+
+    def analyze_signal(self) -> pd.DataFrame:
+        """
+        1) Extract the signal as a series
+        2) Do FFT to find dominant frequency & magnitude
+        3) Fit a sine wave with initial guess -> (A=1, freq=dominant freq, phase=0, offset=0)
+        4) Return a DataFrame with one row: 
+           [dominant_magnitude, dominant_frequency, amplitude, frequency, phase, offset].
+        """
+        if self.df.empty or self.signal_col not in self.df.columns:
+            # no data
+            return pd.DataFrame([], columns=[
+                "dominant_magnitude","dominant_frequency","amplitude","frequency","phase","offset"
+            ])
+
+        signal = self.df[self.signal_col].dropna()
+        if signal.empty:
+            return pd.DataFrame([], columns=[
+                "dominant_magnitude","dominant_frequency","amplitude","frequency","phase","offset"
+            ])
+
+        # 2) FFT
+        fft_values = np.fft.fft(signal)
+        frequencies = np.fft.fftfreq(len(fft_values))
+        fft_magnitude = np.abs(fft_values)
+
+        dominant_freq_idx = np.argmax(fft_magnitude)
+        dominant_frequency = frequencies[dominant_freq_idx]
+        dominant_magnitude = fft_magnitude[dominant_freq_idx]
+
+        # 3) We'll define t = range(len(signal)) for the curve_fit
+        t = np.arange(len(signal))
+
+        # initial guess
+        initial_guess = [1, dominant_frequency, 0, 0]  # A=1, freq=dominant, phase=0, offset=0
+
+        # fallback values
+        amplitude, frequency, phase, offset = np.nan, np.nan, np.nan, np.nan
+
+        # We need at least 4 data points for a 4-parameter fit
+        if len(signal) >= 4:
+            try:
+                params, _ = curve_fit(self._sine_wave, t, signal, p0=initial_guess)
+                amplitude, frequency, phase, offset = params
+            except RuntimeError as e:
+                # Fitting might fail
+                print(f"Sine wave fit failed: {e}")
+        else:
+            print("Not enough data points to do a 4-parameter sine fit.")
+
+        # Return as 1-row DataFrame
+        results = {
+            "dominant_magnitude": round(dominant_magnitude, 3),
+            "dominant_frequency": round(dominant_frequency, 3),
+            "amplitude": round(amplitude, 3),
+            "frequency": round(frequency, 3),
+            "phase": round(phase, 3),
+            "offset": round(offset, 3)
+        }
+        return pd.DataFrame([results])
+
+
+
+class IncrementalOscillation:
+    """
+    Incrementally calculates oscillation metrics (amplitude, frequency, etc.)
+    for a single signal, storing them in an 'oscillation_metrics' table.
+
+    Because your snippet does a single FFT for the entire series,
+    we produce just ONE row each time we have new coverage, referencing the last date.
+    """
+
+    def __init__(
+        self,
+        db,               # Database instance
+        get_signal,       # GetSignal instance
+        project_id="issachar-feature-library",
+        wmg_dataset="wmg",
+        spread_table="daily_spread_returns",  # your table of daily spread returns
+        oscillation_table="oscillation_metrics"
+    ):
+        """
+        Args:
+            db: Database instance
+            get_signal: GetSignal instance
+            project_id, wmg_dataset: BQ locations
+            spread_table: table storing daily spread returns
+            oscillation_table: table to store final oscillation results
+        """
+        self.db = db
+        self.get_signal = get_signal
+        self.project_id = project_id
+        self.wmg_dataset = wmg_dataset
+        self.spread_table = spread_table
+        self.oscillation_table = oscillation_table
+
+        self.bq_client = bigquery.Client(project=self.project_id)
+
+    def run(self, signal_name: str, refresh_data: bool = True):
+        """
+        1) Check existing coverage in oscillation_table => last date we computed for 'signal_name'
+        2) Pull coverage from get_signal (start_date=last_date+1 if partial).
+        3) Merge with daily_spread_returns
+        4) Run FFT + sine wave fitting => single row of amplitude, freq, etc.
+        5) Append new row with 'date' = the last date in coverage + 0 or today
+        """
+        # 1) coverage
+        last_date = self._get_last_coverage_date(signal_name)
+        if last_date is None:
+            new_start_date = None
+        else:
+            new_start_date = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # 2) get coverage from repository
+        df_signal = self.get_signal.run(
+            signal_name,
+            start_date=new_start_date,
+            end_date=None,
+            refresh_data=refresh_data
+        )
+        if df_signal.empty:
+            print(f"No new coverage for '{signal_name}'. No oscillation calculation performed.")
+            return
+
+        # 3) Merge with daily spread returns
+        # We'll fetch from new_start_date - 1 year if partial coverage, for safe
+        if new_start_date:
+            start_for_spread_dt = pd.to_datetime(new_start_date) - timedelta(days=365)
+            start_for_spread = start_for_spread_dt.strftime("%Y-%m-%d")
+        else:
+            start_for_spread = None
+
+        df_spread = self._fetch_spread_in_date_range(start_for_spread, None)
+        if df_spread.empty:
+            print("No spread data found. Stopping.")
+            return
+
+        df_signal.set_index(["date","requestId"], inplace=True)
+        df_spread.set_index(["date","requestId"], inplace=True)
+        df_merged = df_signal.join(df_spread, how="inner").dropna()
+
+        # 4) We only do a single pass of FFT => entire timeseries
+        from your_module import OscillationCalculator  # or place inline
+        oscillator = OscillationCalculator(df_merged, signal_col=signal_name)
+        res_df = oscillator.analyze_signal()  # 1 row w/ dom_magnitude, amplitude, freq, etc.
+
+        if res_df.empty:
+            print("OscillationCalculator returned empty. Possibly no data or insufficient points.")
+            return
+
+        # We'll store a 'signal' column and a 'date' column referencing last date in coverage
+        coverage_dates = df_merged.index.get_level_values("date").unique()
+        coverage_max_date = coverage_dates.max()
+        res_df["signal"] = signal_name
+        res_df["date"] = coverage_max_date  # or maybe store "today" or something
+
+        # 5) Append new row
+        self._append_to_oscillation_table(res_df)
+
+        print(f"Inserted new oscillation row for '{signal_name}' up to date={coverage_max_date}.")
+
+    ###########################################################################
+    # Internal Helpers
+    ###########################################################################
+
+    def _get_last_coverage_date(self, signal_name: str):
+        """
+        Return the last date we have in 'oscillation_table' for this signal.
+        We'll store it in a 'date' column.
+        If none, return None.
+        """
+        full_table = f"{self.project_id}.{self.wmg_dataset}.{self.oscillation_table}"
+        query = f"""
+        SELECT CAST(MAX(date) AS DATETIME) as max_date
+        FROM `{full_table}`
+        WHERE signal = @signal
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[ bigquery.ScalarQueryParameter("signal", "STRING", signal_name) ]
+        )
+        df = self.bq_client.query(query, job_config=job_config).to_dataframe()
+        if df.empty or df.iloc[0].isnull().any():
+            return None
+        return df.iloc[0]["max_date"]
+
+    def _fetch_spread_in_date_range(self, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        Pull daily spread returns from wmg.daily_spread_returns in [start_date..end_date].
+        Return => columns [date, requestId, <whatever the snippet calls 'spread' columns?].
+        We'll assume there's at least a 'spread_return' col or something similar.
+        """
+        # If your table name is different, adjust:
+        full_table = f"{self.project_id}.{self.wmg_dataset}.{self.spread_table}"
+        where_clauses = []
+        params = []
+        if start_date:
+            where_clauses.append("date >= @start_date")
+            params.append(bigquery.ScalarQueryParameter("start_date", "DATETIME", start_date))
+        if end_date:
+            where_clauses.append("date <= @end_date")
+            params.append(bigquery.ScalarQueryParameter("end_date", "DATETIME", end_date))
+
+        w_clause = ""
+        if where_clauses:
+            w_clause = "WHERE " + " AND ".join(where_clauses)
+
+        query = f"""
+        SELECT date, requestId, daily_spread
+        FROM `{full_table}`
+        {w_clause}
+        """
+        job_config = bigquery.QueryJobConfig(query_parameters=params)
+        df = self.bq_client.query(query, job_config=job_config).to_dataframe()
+
+        if df.empty:
+            return pd.DataFrame(columns=["date","requestId","daily_spread"])
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        df.drop_duplicates(["date","requestId"], inplace=True)
+        return df
+
+    def _append_to_oscillation_table(self, df_res: pd.DataFrame):
+        """
+        Append the single row result to your 'oscillation_metrics' table.
+        Columns => [dominant_magnitude, amplitude, frequency, phase, offset, signal, date, ...].
+        """
+        table_id = f"{self.project_id}.{self.wmg_dataset}.{self.oscillation_table}"
+        df_upload = df_res.copy()
+        # ensure columns
+        keep_cols = [
+            "date","signal","dominant_magnitude","dominant_frequency",
+            "amplitude","frequency","phase","offset"
+        ]
+        for c in keep_cols:
+            if c not in df_upload.columns:
+                df_upload[c] = np.nan
+
+        df_upload = df_upload[keep_cols]
+        to_gbq(
+            df_upload,
+            destination_table=f"{self.wmg_dataset}.{self.oscillation_table}",
+            project_id=self.project_id,
+            if_exists="append"
+        )
+
+
         
         
         
@@ -1151,7 +1421,7 @@ if __name__ == '__main__':
         )
 
         # 3) Compute incremental MI for a single signal
-        mi_calc.run("accel_21d", refresh_data = False)
+        mi_calc.run(signal_name, refresh_data = False)
 
         # 4) Fvalue related stats 
         fval_calc = IncrementalFvalue(
@@ -1164,4 +1434,16 @@ if __name__ == '__main__':
             table_rolling_fval="daily_fvalue_interactions"  # if you want the name from snippet
         )
 
-        fval_calc.run("some_signal_name", refresh_data=False)
+        fval_calc.run(signal_name, refresh_data=False)
+
+        osc_calc = IncrementalOscillation(
+            db=db,
+            get_signal=get_signal,
+            project_id="issachar-feature-library",
+            wmg_dataset="wmg",
+            spread_table="daily_spread_returns",
+            oscillation_table="oscillation_metrics"
+        )
+
+        # Suppose we want to do "accel_21d" with daily_spread
+        osc_calc.run(signal_name, refresh_data=False)
