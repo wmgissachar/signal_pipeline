@@ -31,8 +31,9 @@ class Database:
     # 3) daily_ic2 table: store IC metrics
     DAILY_IC2_TABLE = "issachar-feature-library.wmg.daily_ic2"
 
-    def __init__(self, project_id="issachar-feature-library"):
+    def __init__(self, project_id="issachar-feature-library", verbose = True):
         self.project_id = project_id
+        self.verbose = verbose
         self.client = bigquery.Client(project=self.project_id)
         self._create_lookup_table_if_not_exists()
 
@@ -168,14 +169,40 @@ class Database:
 
     def get_or_upload_signal(self, signal_data: dict) -> dict:
         """
-        If a signal with signal_data['signal_name'] is in the table, return it.
+        If a signal with signal_data['signal_name'] is in the table, return that existing row.
         Otherwise, insert the new row and return it.
+
+        Additional logic:
+        - If existing row has signal_type='neither' but new data is baseline/interaction,
+          we update the row using the new info.
         """
         existing = self.get_signal(signal_data["signal_name"])
-        if existing is not None:
-            return existing
-        self.upload_signal(signal_data)
-        return self.get_signal(signal_data["signal_name"])
+        if existing is None:
+            # not in table => insert
+            self.upload_signal(signal_data)
+            return self.get_signal(signal_data["signal_name"])
+
+        # If the existing row is "neither" but the new data is baseline or interaction,
+        # we update the row. For example, if new_data says "baseline" or "interaction",
+        # we prefer that over "neither".
+        if existing["signal_type"] == "neither" and signal_data["signal_type"] != "neither":
+            self.update_signal(signal_data)
+            return self.get_signal(signal_data["signal_name"])
+
+        if existing["signal_type"] != signal_data["signal_type"]:
+            # maybe prefer the "better" type if the new is not 'neither'
+            # or if new has more columns...
+            # in short: do an update if you decide the new data is more accurate
+            self.update_signal(signal_data)
+            return self.get_signal(signal_data["signal_name"])
+
+
+        # Otherwise, just return the existing row. 
+        # (Even if the new data says "interaction" but existing is "baseline", 
+        #  you'd have to decide if you want to override. 
+        #  If so, do more logic here.)
+        return existing
+
 
     ############################################################################
     #  SIGNAL REPOSITORY METHODS (wmg.signal_repository)
@@ -288,7 +315,8 @@ class Database:
         job_config = bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
         job = self.client.load_table_from_dataframe(df_upload, table_id, job_config=job_config)
         job.result()  # wait
-        print(f"Uploaded {len(df_upload)} rows to {table_id} for signal='{signal_name}'.")
+        if self.verbose:
+            print(f"Uploaded {len(df_upload)} rows to {table_id} for signal='{signal_name}'.")
 
     ############################################################################
     #  CORE_RAW DATA METHODS
